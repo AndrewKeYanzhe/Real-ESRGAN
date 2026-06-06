@@ -38,7 +38,8 @@ class RealESRGANer():
                  device=None,
                  gpu_id=None,
                  input_color_space='pq_bt2020',
-                 clip_nits=203.0):
+                 clip_nits=203.0,
+                 dilate_radius=2):
         self.scale = scale
         self.tile_size = tile
         self.tile_pad = tile_pad
@@ -47,6 +48,7 @@ class RealESRGANer():
         self.half = half
         self.input_color_space = input_color_space
         self.clip_nits = clip_nits
+        self.dilate_radius = dilate_radius
         self.max_val = None
 
         # initialize model
@@ -338,6 +340,14 @@ class RealESRGANer():
                     transition_width = 0.1 * threshold
                     max_channel = np.max(accumulated_linear, axis=2, keepdims=True)
                     w = np.clip((max_channel - (threshold - transition_width)) / transition_width, 0.0, 1.0)
+                    
+                    # Apply dilation/max filter to expand the blend region if configured
+                    if hasattr(self, 'dilate_radius') and self.dilate_radius > 0:
+                        kernel_size = 2 * self.dilate_radius + 1
+                        kernel = np.ones((kernel_size, kernel_size), np.uint8)
+                        w_dilated = cv2.dilate(w.squeeze(-1), kernel)
+                        w = np.expand_dims(w_dilated, axis=-1)
+                    
                     accumulated_linear = (1.0 - w) * accumulated_linear + w * linear_out
             
             # Clean up tracking attributes

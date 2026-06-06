@@ -115,6 +115,8 @@ def main():
                         help="Color space pipeline to use")
     parser.add_argument('--clip_nits', type=float, default=CLIP_NITS,
                         help="Clip level in nits for clip_gamma2_2_bt2020 mode")
+    parser.add_argument('--dilate_radius', type=int, default=2,
+                        help="Dilation radius for blending weights (e.g. 2 means 5x5 kernel, 0 means no dilation / original pixel-by-pixel behavior)")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -149,7 +151,8 @@ def main():
         pre_pad=0,
         half=not args.fp32,
         input_color_space=args.color_space,
-        clip_nits=args.clip_nits
+        clip_nits=args.clip_nits,
+        dilate_radius=args.dilate_radius
     )
 
     # 2. Run inference
