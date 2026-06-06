@@ -12,13 +12,16 @@ saved unchanged and then tagged back with the correct BT.2020 PQ color space met
 # Select the color space conversion applied to the image data before sending it to the network.
 # Supported options:
 #   1. "pq_bt2020" : Passes raw PQ values in range [0, 1] directly to the network (original behavior).
-#   2. "extended_gamma2.2_bt2020" : Converts PQ to linear light, scales so that 1.0 maps to 100 nits
+#   2. "extended_gamma2_2_bt2020" : Converts PQ to linear light, scales so that 1.0 maps to 100 nits
 #                                  (meaning HDR highlights can go > 1.0), applies Gamma 2.2, and allows
 #                                  values > 1.0 to pass to the network without clamping.
-#   3. "normalized_gamma2.2_bt2020" : Converts PQ to linear light, normalizes it dynamically so that the
+#   3. "normalized_gamma2_2_bt2020" : Converts PQ to linear light, normalizes it dynamically so that the
 #                                    actual maximum value in the current image maps to 1.0, applies
 #                                    standard Gamma 2.2, runs inference, and reverses the normalization.
-INPUT_COLOR_SPACE = "normalized_gamma2.2_bt2020"
+#   4. "clip_gamma2_2_bt2020" : Converts PQ to linear light, clips values above a configured nit level,
+#                              scales that clip level to 1.0, applies Gamma 2.2, and reverses the scaling.
+INPUT_COLOR_SPACE = "normalized_gamma2_2_bt2020"
+CLIP_NITS = 406.0
 # ---------------------
 
 import argparse
@@ -108,8 +111,10 @@ def main():
     parser.add_argument('--tile', type=int, default=1024, help="Tile size")
     parser.add_argument('--fp32', action='store_true', help="Use fp32 instead of fp16 half precision")
     parser.add_argument('-c', '--color_space', type=str, default=INPUT_COLOR_SPACE,
-                        choices=['pq_bt2020', 'extended_gamma2.2_bt2020', 'normalized_gamma2.2_bt2020'],
+                        choices=['pq_bt2020', 'extended_gamma2_2_bt2020', 'normalized_gamma2_2_bt2020', 'clip_gamma2_2_bt2020'],
                         help="Color space pipeline to use")
+    parser.add_argument('--clip_nits', type=float, default=CLIP_NITS,
+                        help="Clip level in nits for clip_gamma2_2_bt2020 mode")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -143,7 +148,8 @@ def main():
         tile_pad=10,
         pre_pad=0,
         half=not args.fp32,
-        input_color_space=args.color_space
+        input_color_space=args.color_space,
+        clip_nits=args.clip_nits
     )
 
     # 2. Run inference
@@ -151,9 +157,26 @@ def main():
     img = cv2.imread(args.input, cv2.IMREAD_UNCHANGED)
     output, _ = upsampler.enhance(img, outscale=args.outscale)
 
-    # Auto-append the color space mode to the output filename
+    # Auto-append the color space mode and normalization point to the output filename
     base, ext = os.path.splitext(args.output)
-    actual_output = f"{base}_{args.color_space}{ext}"
+    if args.color_space == 'pq_bt2020':
+        color_space_suffix = "pq"
+    elif args.color_space == 'extended_gamma2_2_bt2020':
+        color_space_suffix = "extended_gamma_2.2"
+    elif args.color_space == 'clip_gamma2_2_bt2020':
+        norm_nits = args.clip_nits
+        nits_str = f"{int(round(norm_nits))}"
+        color_space_suffix = f"clip_norm_point_{nits_str}_nits"
+    elif args.color_space == 'normalized_gamma2_2_bt2020':
+        if hasattr(upsampler, 'max_val') and upsampler.max_val is not None:
+            norm_nits = upsampler.max_val * 10000.0
+            nits_str = f"{int(round(norm_nits))}"
+            color_space_suffix = f"normalised_norm_point_{nits_str}_nits"
+        else:
+            color_space_suffix = "normalised_norm_point_unknown_nits"
+    else:
+        color_space_suffix = args.color_space
+    actual_output = f"{base}_{color_space_suffix}{ext}"
 
     # Make output directory if needed
     out_dir = os.path.dirname(actual_output)
