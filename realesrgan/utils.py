@@ -36,13 +36,15 @@ class RealESRGANer():
                  pre_pad=10,
                  half=False,
                  device=None,
-                 gpu_id=None):
+                 gpu_id=None,
+                 input_color_space='pq_bt2020'):
         self.scale = scale
         self.tile_size = tile
         self.tile_pad = tile_pad
         self.pre_pad = pre_pad
         self.mod_scale = None
         self.half = half
+        self.input_color_space = input_color_space
 
         # initialize model
         if gpu_id:
@@ -215,6 +217,34 @@ class RealESRGANer():
             img_mode = 'RGB'
             img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
+        if self.input_color_space in ['extended_gamma2.2_bt2020', 'normalized_gamma2.2_bt2020']:
+            # 1. Convert PQ to linear [0, 1] (where 1.0 = 10,000 nits)
+            m1, m2 = 2610.0 / 16384.0, 78.84375
+            c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
+            pq_pow = np.power(img, 1.0 / m2)
+            num = np.maximum(pq_pow - c1, 0.0)
+            den = c2 - c3 * pq_pow
+            linear = np.power(num / den, 1.0 / m1)  # 1.0 = 10,000 nits
+            
+            # Calculate and print peak luminance info
+            max_val = np.max(linear)
+            peak_nits = max_val * 10000.0
+            sdr_ratio = peak_nits / 100.0
+            print(f'\t[Color Space] Using EDR 1.0 = 100 nits, input image has single channel max of {sdr_ratio:.2f}x SDR')
+            
+            if self.input_color_space == 'extended_gamma2.2_bt2020':
+                # Scale linear so 1.0 = 100 nits (highlights go > 1.0)
+                linear_scaled = linear * 100.0
+            else:
+                # Dynamically normalize so the actual max value in the image maps to 1.0
+                if max_val <= 0.0:
+                    max_val = 1.0
+                self.max_val = max_val
+                linear_scaled = linear / max_val
+            
+            # 2. Apply Gamma 2.2 encoding
+            img = np.power(np.maximum(linear_scaled, 0.0), 1.0 / 2.2)
+
         # ------------------- process image (without the alpha channel) ------------------- #
         self.pre_process(img)
         if self.tile_size > 0:
@@ -222,8 +252,34 @@ class RealESRGANer():
         else:
             self.process()
         output_img = self.post_process()
-        output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+        
+        if self.input_color_space == 'extended_gamma2.2_bt2020':
+            output_img = output_img.data.squeeze().float().cpu().clamp_(min=0.0).numpy()
+        else:
+            output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+            
         output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
+
+        if self.input_color_space in ['extended_gamma2.2_bt2020', 'normalized_gamma2.2_bt2020']:
+            # 1. Convert Gamma 2.2 back to linear
+            linear_scaled = np.power(output_img, 2.2)
+            
+            if self.input_color_space == 'extended_gamma2.2_bt2020':
+                # Scale back to standard linear [0, 1] (where 1.0 = 10,000 nits)
+                linear = linear_scaled / 100.0
+            else:
+                # Revert dynamic normalization using the stored max_val
+                linear = linear_scaled * self.max_val
+            
+            # 2. Convert linear to PQ
+            m1, m2 = 2610.0 / 16384.0, 78.84375
+            c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
+            linear = np.clip(linear, 0.0, 1.0)
+            lin_pow = np.power(linear, m1)
+            num = c1 + c2 * lin_pow
+            den = 1.0 + c3 * lin_pow
+            output_img = np.power(num / den, m2)
+
         if img_mode == 'L':
             output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
 

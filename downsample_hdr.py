@@ -2,9 +2,16 @@
 Downsamples PQ-encoded HDR AVIF images to 16-bit PNG.
 Performs the downsampling interpolation in 32-bit floating-point linear light (linear gamma)
 to prevent color and highlight distortion, before re-encoding to PQ space.
-Applies the zscale color pipeline and injects the 'cICP' and 'iCCP' chunks to allow native 
+Applies the zscale color pipeline and injects the 'cICP' and 'iCCP' chunks to allow native
 HDR rendering in Chrome.
 """
+
+# --- CONFIGURATION ---
+# Downsample settings. You can specify either a factor or a target width.
+# If both or neither are set, the script will return an error.
+DOWNSAMPLE_FACTOR = None     # Downsample factor (e.g. 4 for 1/4 size). Set to None to use TARGET_WIDTH.
+TARGET_WIDTH = 512       # Target width in pixels (height will be calculated proportionally). Set to None to use DOWNSAMPLE_FACTOR.
+# ---------------------
 
 import argparse
 import json
@@ -44,7 +51,7 @@ def inject_hdr_chunks_to_png(png_path):
     out_chunks = [data[:8]]
     pos = 8
     ihdr_found = False
-    
+
     # cICP chunk
     cicp_data = b"\x09\x10\x00\x01"
     new_cicp = make_chunk(b"cICP", cicp_data)
@@ -98,7 +105,7 @@ def get_image_dimensions(input_path):
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     if result.returncode != 0:
         raise RuntimeError(f"Failed to probe image dimensions: {result.stderr}")
-    
+
     data = json.loads(result.stdout)
     if 'streams' in data and len(data['streams']) > 0:
         width = data['streams'][0]['width']
@@ -110,32 +117,54 @@ def get_image_dimensions(input_path):
 def main():
     parser = argparse.ArgumentParser(description="Downsample HDR AVIF images in linear space to PNG for testing")
     parser.add_argument('-i', '--input', type=str, required=True, help="Input AVIF file path")
-    parser.add_argument('-f', '--factor', type=int, default=4, help="Downsample factor (e.g. 4 for 1/4 size)")
+    parser.add_argument('-f', '--factor', type=int, default=None, help="Downsample factor (e.g. 4 for 1/4 size)")
+    parser.add_argument('-w', '--width', type=int, default=None, help="Target width in pixels")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"Input file not found: {args.input}")
 
+    # Determine parameter values: CLI overrides top-level configuration
+    factor = args.factor
+    width_param = args.width
+
+    if factor is None and width_param is None:
+        factor = DOWNSAMPLE_FACTOR
+        width_param = TARGET_WIDTH
+
+    # Exclusivity validation
+    if factor is not None and width_param is not None:
+        parser.error("Both downsample factor and target width are set. Please set only one of them.")
+    if factor is None and width_param is None:
+        parser.error("Neither downsample factor nor target width is set. Please set one.")
+
     # 1. Probing original dimensions
     print("--- Probing Input Image Metadata ---")
-    width, height = get_image_dimensions(args.input)
-    new_width = int(width / args.factor)
-    new_height = int(height / args.factor)
-    
+    orig_width, orig_height = get_image_dimensions(args.input)
+
+    if factor is not None:
+        new_width = int(orig_width / factor)
+        new_height = int(orig_height / factor)
+        size_desc = f"1/{factor} scale"
+    else:
+        new_width = width_param
+        new_height = int((orig_height * width_param) / orig_width)
+        size_desc = f"target width {width_param}"
+
     # Ensure dimensions are even numbers
     if new_width % 2 != 0:
         new_width += 1
     if new_height % 2 != 0:
         new_height += 1
 
-    print(f"Original size: {width}x{height}")
-    print(f"Target size (1/{args.factor} scale): {new_width}x{new_height}")
+    print(f"Original size: {orig_width}x{orig_height}")
+    print(f"Target size ({size_desc}): {new_width}x{new_height}")
 
     # Prepare inputs directory
     os.makedirs("inputs", exist_ok=True)
-    
+
     base_name = os.path.splitext(os.path.basename(args.input))[0]
-    out_png = os.path.join("inputs", f"{base_name}_lr.png")
+    out_png = os.path.join("inputs", f"{base_name}_{new_width}x{new_height}.png")
 
     # 2. Downsample in linear space to 16-bit PNG (for Real-ESRGAN input)
     print("\n--- Downsampling to 16-bit PNG (inference input) ---")
@@ -147,7 +176,7 @@ def main():
         out_png
     ]
     run_command(png_cmd)
-    
+
     # Inject cICP and iCCP chunks to the output PNG
     inject_hdr_chunks_to_png(out_png)
 

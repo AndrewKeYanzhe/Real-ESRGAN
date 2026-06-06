@@ -1,12 +1,25 @@
 """
-Upscales 16-bit HDR PNG images using Real-ESRGAN on GPU and automatically injects 
+Upscales 16-bit HDR PNG images using Real-ESRGAN on GPU and automatically injects
 the 'cICP' and 'iCCP' chunks to allow native HDR rendering in Chrome.
 
-Note: This script does not modify or convert the pixel values of the input during 
-the upscaling process. It passes the BT.2020 PQ-encoded image data directly to 
-the network (which internally expects BT.709 gamma 2.2). The output pixels are 
+Note: This script does not modify or convert the pixel values of the input during
+the upscaling process. It passes the BT.2020 PQ-encoded image data directly to
+the network (which internally expects BT.709 gamma 2.2). The output pixels are
 saved unchanged and then tagged back with the correct BT.2020 PQ color space metadata.
 """
+
+# --- CONFIGURATION ---
+# Select the color space conversion applied to the image data before sending it to the network.
+# Supported options:
+#   1. "pq_bt2020" : Passes raw PQ values in range [0, 1] directly to the network (original behavior).
+#   2. "extended_gamma2.2_bt2020" : Converts PQ to linear light, scales so that 1.0 maps to 100 nits
+#                                  (meaning HDR highlights can go > 1.0), applies Gamma 2.2, and allows
+#                                  values > 1.0 to pass to the network without clamping.
+#   3. "normalized_gamma2.2_bt2020" : Converts PQ to linear light, normalizes it dynamically so that the
+#                                    actual maximum value in the current image maps to 1.0, applies
+#                                    standard Gamma 2.2, runs inference, and reverses the normalization.
+INPUT_COLOR_SPACE = "normalized_gamma2.2_bt2020"
+# ---------------------
 
 import argparse
 import os
@@ -49,7 +62,7 @@ def inject_hdr_chunks_to_png(png_path):
     out_chunks = [data[:8]]
     pos = 8
     ihdr_found = False
-    
+
     # cICP chunk
     cicp_data = b"\x09\x10\x00\x01"
     new_cicp = make_chunk(b"cICP", cicp_data)
@@ -89,11 +102,14 @@ def main():
     parser = argparse.ArgumentParser(description="Upscale HDR PNG images and tag with cICP + iCCP PQ HDR metadata")
     parser.add_argument('-i', '--input', type=str, required=True, help="Input PNG file path")
     parser.add_argument('-o', '--output', type=str, required=True, help="Output PNG file path")
-    parser.add_argument('-n', '--model_name', type=str, default='RealESRNet_x4plus', 
+    parser.add_argument('-n', '--model_name', type=str, default='RealESRNet_x4plus',
                         help="Model name: RealESRGAN_x4plus | RealESRNet_x4plus")
     parser.add_argument('-s', '--outscale', type=float, default=4, help="Upscale factor")
     parser.add_argument('--tile', type=int, default=1024, help="Tile size")
     parser.add_argument('--fp32', action='store_true', help="Use fp32 instead of fp16 half precision")
+    parser.add_argument('-c', '--color_space', type=str, default=INPUT_COLOR_SPACE,
+                        choices=['pq_bt2020', 'extended_gamma2.2_bt2020', 'normalized_gamma2.2_bt2020'],
+                        help="Color space pipeline to use")
     args = parser.parse_args()
 
     if not os.path.exists(args.input):
@@ -126,7 +142,8 @@ def main():
         tile=args.tile,
         tile_pad=10,
         pre_pad=0,
-        half=not args.fp32
+        half=not args.fp32,
+        input_color_space=args.color_space
     )
 
     # 2. Run inference
@@ -134,21 +151,25 @@ def main():
     img = cv2.imread(args.input, cv2.IMREAD_UNCHANGED)
     output, _ = upsampler.enhance(img, outscale=args.outscale)
 
+    # Auto-append the color space mode to the output filename
+    base, ext = os.path.splitext(args.output)
+    actual_output = f"{base}_{args.color_space}{ext}"
+
     # Make output directory if needed
-    out_dir = os.path.dirname(args.output)
+    out_dir = os.path.dirname(actual_output)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
 
     # Write output PNG
-    cv2.imwrite(args.output, output)
-    print(f"Upscaled image temporarily saved to: {args.output}")
+    cv2.imwrite(actual_output, output)
+    print(f"Upscaled image temporarily saved to: {actual_output}")
 
     # 3. Inject HDR tags
     print("\n--- Step 3: Injecting HDR Metadata ---")
-    inject_hdr_chunks_to_png(args.output)
-    
+    inject_hdr_chunks_to_png(actual_output)
+
     print("\n--- Done! ---")
-    print(f"HDR Upscaled PNG saved to: {args.output}")
+    print(f"HDR Upscaled PNG saved to: {actual_output}")
 
 if __name__ == "__main__":
     main()
