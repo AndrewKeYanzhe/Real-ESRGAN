@@ -111,7 +111,7 @@ def main():
     parser.add_argument('--tile', type=int, default=1024, help="Tile size")
     parser.add_argument('--fp32', action='store_true', help="Use fp32 instead of fp16 half precision")
     parser.add_argument('-c', '--color_space', type=str, default=INPUT_COLOR_SPACE,
-                        choices=['pq_bt2020', 'extended_gamma2_2_bt2020', 'normalized_gamma2_2_bt2020', 'clip_gamma2_2_bt2020'],
+                        choices=['pq_bt2020', 'extended_gamma2_2_bt2020', 'normalized_gamma2_2_bt2020', 'clip_gamma2_2_bt2020', 'multipass_clip_gamma2_2_bt2020'],
                         help="Color space pipeline to use")
     parser.add_argument('--clip_nits', type=float, default=CLIP_NITS,
                         help="Clip level in nits for clip_gamma2_2_bt2020 mode")
@@ -167,6 +167,10 @@ def main():
         norm_nits = args.clip_nits
         nits_str = f"{int(round(norm_nits))}"
         color_space_suffix = f"clip_norm_point_{nits_str}_nits"
+    elif args.color_space == 'multipass_clip_gamma2_2_bt2020':
+        norm_nits = args.clip_nits
+        nits_str = f"{int(round(norm_nits))}"
+        color_space_suffix = f"multipass_clip_norm_point_{nits_str}_nits"
     elif args.color_space == 'normalized_gamma2_2_bt2020':
         if hasattr(upsampler, 'max_val') and upsampler.max_val is not None:
             norm_nits = upsampler.max_val * 10000.0

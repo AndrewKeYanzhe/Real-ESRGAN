@@ -134,6 +134,9 @@ class RealESRGANer():
         self.output = self.img.new_zeros(output_shape)
         tiles_x = math.ceil(width / self.tile_size)
         tiles_y = math.ceil(height / self.tile_size)
+        
+        skipped_tiles_count = 0
+        total_tiles_count = tiles_x * tiles_y
 
         # loop over all tiles
         for y in range(tiles_y):
@@ -159,13 +162,27 @@ class RealESRGANer():
                 tile_idx = y * tiles_x + x + 1
                 input_tile = self.img[:, :, input_start_y_pad:input_end_y_pad, input_start_x_pad:input_end_x_pad]
 
-                # upscale tile
-                try:
-                    with torch.no_grad():
-                        output_tile = self.model(input_tile)
-                except RuntimeError as error:
-                    print('Error', error)
-                print(f'\tTile {tile_idx}/{tiles_x * tiles_y}')
+                # check if tile can be skipped in multi-pass mode
+                skip_tile = False
+                if hasattr(self, 'current_pass_index') and self.current_pass_index > 0:
+                    threshold = (self.prev_clip / self.current_clip) ** (1.0 / 2.2)
+                    if torch.max(input_tile).item() <= threshold:
+                        skip_tile = True
+
+                if skip_tile:
+                    skipped_tiles_count += 1
+                    output_tile = input_tile.new_zeros(
+                        (batch, channel, (input_end_y_pad - input_start_y_pad) * self.scale, (input_end_x_pad - input_start_x_pad) * self.scale)
+                    )
+                else:
+                    # upscale tile
+                    try:
+                        with torch.no_grad():
+                            output_tile = self.model(input_tile)
+                    except RuntimeError as error:
+                        print('Error', error)
+                    if not hasattr(self, 'current_pass_index'):
+                        print(f'\tTile {tile_idx}/{tiles_x * tiles_y}')
 
                 # output tile area on total image
                 output_start_x = input_start_x * self.scale
@@ -183,6 +200,8 @@ class RealESRGANer():
                 self.output[:, :, output_start_y:output_end_y,
                             output_start_x:output_end_x] = output_tile[:, :, output_start_y_tile:output_end_y_tile,
                                                                        output_start_x_tile:output_end_x_tile]
+        if hasattr(self, 'current_pass_index'):
+            print(f'\tPass {self.current_pass_index + 1}: Processed {total_tiles_count - skipped_tiles_count}/{total_tiles_count} tiles (skipped {skipped_tiles_count})')
 
     def post_process(self):
         # remove extra pad
@@ -258,42 +277,120 @@ class RealESRGANer():
             img = np.power(np.maximum(linear_scaled, 0.0), 1.0 / 2.2)
 
         # ------------------- process image (without the alpha channel) ------------------- #
-        self.pre_process(img)
-        if self.tile_size > 0:
-            self.tile_process()
-        else:
-            self.process()
-        output_img = self.post_process()
-        
-        if self.input_color_space == 'extended_gamma2_2_bt2020':
-            output_img = output_img.data.squeeze().float().cpu().clamp_(min=0.0).numpy()
-        else:
-            output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
-            
-        output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
-
-        if self.input_color_space in ['extended_gamma2_2_bt2020', 'normalized_gamma2_2_bt2020', 'clip_gamma2_2_bt2020']:
-            # 1. Convert Gamma 2.2 back to linear
-            linear_scaled = np.power(output_img, 2.2)
-            
-            if self.input_color_space == 'extended_gamma2_2_bt2020':
-                # Scale back to standard linear [0, 1] (where 1.0 = 10,000 nits)
-                linear = linear_scaled / 100.0
-            elif self.input_color_space == 'clip_gamma2_2_bt2020':
-                # Scale back from [0, 1] (where 1.0 = clip_nits) to [0, 10000 nits] range
-                linear = (linear_scaled * self.clip_nits) / 10000.0
-            else:
-                # Revert dynamic normalization using the stored max_val
-                linear = linear_scaled * self.max_val
-            
-            # 2. Convert linear to PQ
+        if self.input_color_space == 'multipass_clip_gamma2_2_bt2020':
+            # 1. Convert PQ to linear [0, 1] (where 1.0 = 10,000 nits)
             m1, m2 = 2610.0 / 16384.0, 78.84375
             c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
-            linear = np.clip(linear, 0.0, 1.0)
-            lin_pow = np.power(linear, m1)
+            pq_pow = np.power(img, 1.0 / m2)
+            num = np.maximum(pq_pow - c1, 0.0)
+            den = c2 - c3 * pq_pow
+            linear = np.power(num / den, 1.0 / m1)  # 1.0 = 10,000 nits
+
+            # Determine peak luminance
+            max_val = np.max(linear)
+            peak_nits = max_val * 10000.0
+            
+            # Generate clip points
+            C_0 = self.clip_nits
+            clip_points = []
+            current_clip = C_0
+            while True:
+                clip_points.append(current_clip)
+                if current_clip >= peak_nits or current_clip >= 10000.0:
+                    break
+                current_clip = min(current_clip * 10.0, 10000.0)
+            
+            print(f'\t[Color Space] Multi-pass clip mode. Base clip = {C_0:.2f} nits. Image peak = {peak_nits:.2f} nits. Total passes = {len(clip_points)}')
+            
+            accumulated_linear = None
+            
+            for k, clip_val in enumerate(clip_points):
+                # Prepare input image for this pass
+                linear_clipped = np.clip(linear, 0.0, clip_val / 10000.0)
+                linear_scaled = linear_clipped / (clip_val / 10000.0)
+                img_pass = np.power(np.maximum(linear_scaled, 0.0), 1.0 / 2.2)
+                
+                # Set dynamic tracking properties for tile processing
+                self.current_pass_index = k
+                self.current_clip = clip_val
+                if k > 0:
+                    self.prev_clip = clip_points[k - 1]
+                
+                # Model inference
+                self.pre_process(img_pass)
+                if self.tile_size > 0:
+                    self.tile_process()
+                else:
+                    self.process()
+                output_tensor = self.post_process()
+                
+                # Convert back to linear
+                output_img_pass = output_tensor.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                output_img_pass = np.transpose(output_img_pass[[2, 1, 0], :, :], (1, 2, 0))
+                linear_scaled_out = np.power(output_img_pass, 2.2)
+                linear_out = (linear_scaled_out * clip_val) / 10000.0
+                
+                if k == 0:
+                    accumulated_linear = linear_out
+                else:
+                    prev_clip_val = clip_points[k - 1]
+                    threshold = prev_clip_val / 10000.0
+                    transition_width = 0.1 * threshold
+                    max_channel = np.max(accumulated_linear, axis=2, keepdims=True)
+                    w = np.clip((max_channel - (threshold - transition_width)) / transition_width, 0.0, 1.0)
+                    accumulated_linear = (1.0 - w) * accumulated_linear + w * linear_out
+            
+            # Clean up tracking attributes
+            if hasattr(self, 'current_pass_index'):
+                del self.current_pass_index
+            if hasattr(self, 'current_clip'):
+                del self.current_clip
+            if hasattr(self, 'prev_clip'):
+                del self.prev_clip
+                
+            # Convert final accumulated linear image to PQ
+            accumulated_linear = np.clip(accumulated_linear, 0.0, 1.0)
+            lin_pow = np.power(accumulated_linear, m1)
             num = c1 + c2 * lin_pow
             den = 1.0 + c3 * lin_pow
             output_img = np.power(num / den, m2)
+        else:
+            self.pre_process(img)
+            if self.tile_size > 0:
+                self.tile_process()
+            else:
+                self.process()
+            output_img = self.post_process()
+            
+            if self.input_color_space == 'extended_gamma2_2_bt2020':
+                output_img = output_img.data.squeeze().float().cpu().clamp_(min=0.0).numpy()
+            else:
+                output_img = output_img.data.squeeze().float().cpu().clamp_(0, 1).numpy()
+                
+            output_img = np.transpose(output_img[[2, 1, 0], :, :], (1, 2, 0))
+
+            if self.input_color_space in ['extended_gamma2_2_bt2020', 'normalized_gamma2_2_bt2020', 'clip_gamma2_2_bt2020']:
+                # 1. Convert Gamma 2.2 back to linear
+                linear_scaled = np.power(output_img, 2.2)
+                
+                if self.input_color_space == 'extended_gamma2_2_bt2020':
+                    # Scale back to standard linear [0, 1] (where 1.0 = 10,000 nits)
+                    linear = linear_scaled / 100.0
+                elif self.input_color_space == 'clip_gamma2_2_bt2020':
+                    # Scale back from [0, 1] (where 1.0 = clip_nits) to [0, 10000 nits] range
+                    linear = (linear_scaled * self.clip_nits) / 10000.0
+                else:
+                    # Revert dynamic normalization using the stored max_val
+                    linear = linear_scaled * self.max_val
+                
+                # 2. Convert linear to PQ
+                m1, m2 = 2610.0 / 16384.0, 78.84375
+                c1, c2, c3 = 0.8359375, 18.8515625, 18.6875
+                linear = np.clip(linear, 0.0, 1.0)
+                lin_pow = np.power(linear, m1)
+                num = c1 + c2 * lin_pow
+                den = 1.0 + c3 * lin_pow
+                output_img = np.power(num / den, m2)
 
         if img_mode == 'L':
             output_img = cv2.cvtColor(output_img, cv2.COLOR_BGR2GRAY)
