@@ -26,26 +26,11 @@ def make_chunk(chunk_type, chunk_data):
     return length_bytes + chunk_type + chunk_data + crc_bytes
 
 def load_icc_profile():
-    h_path = r"c:\Users\Andrew Ke\Desktop\jxr_to_png\icc_profile.h"
-    if not os.path.exists(h_path):
-        raise FileNotFoundError(f"Could not find icc_profile.h at {h_path}")
-        
-    with open(h_path, "r") as f:
-        content = f.read()
-        
-    start = content.find("icc_data[] =")
-    if start == -1:
-        raise ValueError("Could not find icc_data in icc_profile.h")
-    start = content.find("{", start)
-    end = content.find("}", start)
-    bytes_str = content[start+1:end]
-    
-    bytes_list = []
-    for val in bytes_str.split(","):
-        val = val.strip()
-        if val.startswith("0x") or val.startswith("0X"):
-            bytes_list.append(int(val, 16))
-    return bytes(bytes_list)
+    icc_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Rec2100PQ.icc")
+    if not os.path.exists(icc_path):
+        raise FileNotFoundError(f"Could not find Rec2100PQ.icc at {icc_path}")
+    with open(icc_path, "rb") as f:
+        return f.read()
 
 def inject_hdr_chunks_to_png(png_path):
     try:
